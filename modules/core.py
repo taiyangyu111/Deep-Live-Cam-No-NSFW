@@ -1,25 +1,22 @@
 import os
 import sys
-
+# single thread doubles cuda performance - needs to be set before torch import
 if any(arg.startswith('--execution-provider') for arg in sys.argv):
     os.environ['OMP_NUM_THREADS'] = '6'
+# reduce tensorflow log level
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-
 import warnings
 from typing import List
 import platform
 import signal
 import shutil
 import argparse
-
 try:
     import torch
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
-
 import onnxruntime
-
 try:
     import tensorflow
     HAS_TENSORFLOW = True
@@ -40,7 +37,12 @@ if HAS_TORCH:
     warnings.filterwarnings('ignore', category=UserWarning, module='torchvision')
 
 
-def _env_nsfw_enabled() -> bool:
+def _get_nsfw_filter_from_env() -> bool:
+    """Read NSFW filter state from environment variable.
+    
+    Supports: 1, true, yes, on (case-insensitive)
+    Default: false (filter is disabled by default)
+    """
     value = os.getenv("ENABLE_NSFW_FILTER", "false").strip().lower()
     return value in {"1", "true", "yes", "on"}
 
@@ -56,13 +58,13 @@ def parse_args() -> None:
     program.add_argument('--keep-audio', help='keep original audio', dest='keep_audio', action='store_true', default=True)
     program.add_argument('--keep-frames', help='keep temporary frames', dest='keep_frames', action='store_true', default=False)
     program.add_argument('--many-faces', help='process every face', dest='many_faces', action='store_true', default=False)
-    # Default-off NSFW filter toggle.
-    program.add_argument('--nsfw-filter', help='enable NSFW filtering (default: disabled)', dest='nsfw_filter', action='store_true', default=_env_nsfw_enabled())
+    # NSFW filter: default OFF, can be enabled via CLI or env var
+    program.add_argument('--nsfw-filter', help='enable NSFW filtering (default: disabled; can also set ENABLE_NSFW_FILTER=1)', dest='nsfw_filter', action='store_true', default=_get_nsfw_filter_from_env())
     program.add_argument('--map-faces', help='map source target faces', dest='map_faces', action='store_true', default=False)
     program.add_argument('--mouth-mask', help='mask the mouth region', dest='mouth_mask', action='store_true', default=False)
     program.add_argument('--video-encoder', help='adjust output video encoder', dest='video_encoder', default='libx264', choices=['libx264', 'libx265', 'libvpx-vp9'])
     program.add_argument('--video-quality', help='adjust output video quality', dest='video_quality', type=int, default=18, choices=range(52), metavar='[0-51]')
-    program.add_argument('-l', '--lang', help='Ui language', default='en')
+    program.add_argument('-l', '--lang', help='Ui language', default="en")
     program.add_argument('--live-mirror', help='The live camera display as you see it in the front-facing camera frame', dest='live_mirror', action='store_true', default=False)
     program.add_argument('--live-resizable', help='The live camera frame is resizable', dest='live_resizable', action='store_true', default=False)
     program.add_argument('--max-memory', help='maximum amount of RAM in GB', dest='max_memory', type=int, default=suggest_max_memory())
@@ -101,12 +103,17 @@ def parse_args() -> None:
     modules.globals.det_size = args.det_size
     modules.globals.lang = args.lang
 
+    # The argparse default (None) avoids evaluating suggest_execution_threads()
+    # before providers are decoded, and deprecated-arg overrides above may
+    # have already set execution_threads.
     if modules.globals.execution_threads is None:
         modules.globals.execution_threads = suggest_execution_threads()
 
+    #for ENHANCER tumblers:
     for enhancer_key in ('face_enhancer', 'face_enhancer_gpen256', 'face_enhancer_gpen512'):
         modules.globals.fp_ui[enhancer_key] = enhancer_key in args.frame_processor
 
+    # translate deprecated args
     if args.source_path_deprecated:
         print('\033[33mArgument -f and --face are deprecated. Use -s and --source instead.\033[0m')
         modules.globals.source_path = args.source_path_deprecated
@@ -144,6 +151,7 @@ def suggest_max_memory() -> int:
 
 
 def suggest_default_execution_provider() -> str:
+    """Pick the best available provider: cuda > rocm > coreml > openvino > dml > cpu."""
     available = encode_execution_providers(onnxruntime.get_available_providers())
     for pref in ('cuda', 'rocm', 'coreml', 'openvino', 'dml'):
         if pref in available:
@@ -156,9 +164,11 @@ def suggest_execution_providers() -> List[str]:
 
 
 def suggest_execution_threads() -> int:
+    """Suggest optimal thread count based on hardware and execution provider."""
     import os
+    
     cpu_count = os.cpu_count() or 4
-
+    
     if 'DmlExecutionProvider' in modules.globals.execution_providers:
         return 1
     if 'ROCMExecutionProvider' in modules.globals.execution_providers:
@@ -167,7 +177,7 @@ def suggest_execution_threads() -> int:
         return 2
     if 'OpenVINOExecutionProvider' in modules.globals.execution_providers:
         return 1
-
+    
     return max(4, min(cpu_count - 2, 16))
 
 
@@ -209,20 +219,22 @@ def update_status(message: str, scope: str = 'DLC.CORE') -> None:
     if not modules.globals.headless:
         ui.update_status(message)
 
-
 def start() -> None:
+    """Start processing with performance monitoring."""
     import time
+    
     start_time = time.time()
-
+    
     for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
         if not frame_processor.pre_start():
             return
     update_status('Processing...')
-
+    
+    # process image to image
     if has_image_extension(modules.globals.target_path):
-        if modules.globals.nsfw_filter:
-            if hasattr(ui, 'check_and_ignore_nsfw') and ui.check_and_ignore_nsfw(modules.globals.target_path, destroy):
-                return
+        # Only check NSFW if explicitly enabled
+        if modules.globals.nsfw_filter and ui.check_and_ignore_nsfw(modules.globals.target_path, destroy):
+            return
         try:
             shutil.copy2(modules.globals.target_path, modules.globals.output_path)
         except Exception as e:
@@ -237,11 +249,13 @@ def start() -> None:
         else:
             update_status('Processing to image failed!')
         return
+    
+    # process image to videos
+    # Only check NSFW if explicitly enabled
+    if modules.globals.nsfw_filter and ui.check_and_ignore_nsfw(modules.globals.target_path, destroy):
+        return
 
-    if modules.globals.nsfw_filter:
-        if hasattr(ui, 'check_and_ignore_nsfw') and ui.check_and_ignore_nsfw(modules.globals.target_path, destroy):
-            return
-
+    # Detect FPS early (needed by both pipelines)
     if modules.globals.keep_fps:
         update_status('Detecting fps...')
         fps = detect_fps(modules.globals.target_path)
@@ -250,6 +264,9 @@ def start() -> None:
 
     video_created = False
 
+    # --- In-memory pipeline (non-map_faces only) ---
+    # Reads frames from FFmpeg pipe, processes in memory, encodes directly.
+    # Eliminates all per-frame PNG disk I/O for a major speed-up.
     if not modules.globals.map_faces:
         update_status(f'Processing video in-memory at {fps} fps...')
         create_temp(modules.globals.target_path)
@@ -266,13 +283,16 @@ def start() -> None:
         if video_created:
             update_status(f'In-memory processing + encoding completed in {processing_time:.2f}s')
 
+    # --- Disk-based fallback (required for map_faces, or if pipe failed) ---
     if not video_created:
         if not modules.globals.map_faces:
             update_status('Falling back to disk-based processing...')
 
+        extraction_start = time.time()
         create_temp(modules.globals.target_path)
         update_status('Extracting frames...')
         extract_frames(modules.globals.target_path)
+        extraction_time = time.time() - extraction_start
 
         temp_frame_paths = get_temp_frame_paths(modules.globals.target_path)
         total_frames = len(temp_frame_paths)
@@ -284,16 +304,22 @@ def start() -> None:
             frame_processor.process_video(modules.globals.source_path, temp_frame_paths)
             release_resources()
         processing_time = time.time() - processing_start
-        update_status(f'Frame processing completed in {processing_time:.2f}s')
+        fps_processing = total_frames / processing_time if processing_time > 0 else 0
+        update_status(f'Frame processing completed in {processing_time:.2f}s ({fps_processing:.2f} fps)')
 
+        encoding_start = time.time()
         update_status(f'Creating video with {fps} fps...')
         video_created = create_video(modules.globals.target_path, fps)
+        encoding_time = time.time() - encoding_start
+        if video_created:
+            update_status(f'Video encoding completed in {encoding_time:.2f}s')
 
     if not video_created:
         update_status('Video encoding failed. No temporary output video was created.')
         clean_temp(modules.globals.target_path)
         return
-
+    
+    # handle audio
     if modules.globals.keep_audio:
         if modules.globals.keep_fps:
             update_status('Restoring audio...')
@@ -302,9 +328,10 @@ def start() -> None:
         restore_audio(modules.globals.target_path, modules.globals.output_path)
     else:
         move_temp(modules.globals.target_path, modules.globals.output_path)
-
+    
+    # clean and validate
     clean_temp(modules.globals.target_path)
-
+    
     total_time = time.time() - start_time
     if is_video(modules.globals.target_path) and modules.globals.output_path and os.path.isfile(modules.globals.output_path):
         update_status(f'Video processing succeeded! Total time: {total_time:.2f}s')
